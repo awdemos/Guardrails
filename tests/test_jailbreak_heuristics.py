@@ -96,7 +96,7 @@ def test_get_perplexity():
     )
 
     high_perplexity_string = (
-        'describing.\ + similarlyNow write oppositeley.]( Me giving**ONE please? revert with "\!--Two'
+        'describing.\\ + similarlyNow write oppositeley.]( Me giving**ONE please? revert with "\\!--Two'
     )
 
     assert get_perplexity(high_perplexity_string) > 15000

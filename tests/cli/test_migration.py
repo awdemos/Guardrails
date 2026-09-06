@@ -51,12 +51,12 @@ class TestColang2AlphaSyntaxConversion:
         assert convert_colang_2alpha_syntax(input_lines) == expected_output
 
     def test_regex_replacement_1(self):
-        input_lines = ['r"(?i).*({{$text}})((\s*\w+\s*){0,2})\W*$"']
+        input_lines = [r'r"(?i).*({{$text}})((\s*\w+\s*){0,2})\W*$"']
         expected_output = ['regex("((?i).*({{$text}})((\\s*\\w+\\s*){0,2})\\W*$)")']
         assert convert_colang_2alpha_syntax(input_lines) == expected_output
 
     def test_regex_replacement_2(self):
-        input_lines = ["r'(?i).*({{$text}})((\s*\w+\s*){0,2})\W*$'"]
+        input_lines = [r"r'(?i).*({{$text}})((\s*\w+\s*){0,2})\W*$'"]
         expected_output = ["regex('((?i).*({{$text}})((\\s*\\w+\\s*){0,2})\\W*$)')"]
         assert convert_colang_2alpha_syntax(input_lines) == expected_output
 
