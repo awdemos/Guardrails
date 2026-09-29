@@ -20,6 +20,75 @@
       "title": "AIDefenseRailConfig",
       "type": "object"
     },
+    "ArbiterConfig": {
+      "description": "Configuration for the Arbiter moderation rail.",
+      "properties": {
+        "api_key": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Optional Bearer token for the Arbiter sidecar. Falls back to the ARBITER_API_KEY env var.",
+          "title": "Api Key"
+        },
+        "base_url": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Base URL of the Arbiter sidecar. Falls back to the ARBITER_URL env var, then http://localhost:8010.",
+          "title": "Base Url"
+        },
+        "block_threshold": {
+          "default": 0.9,
+          "description": "Probability at or above which the message is blocked. Applies to the risk nouls (jailbreak, harmful, off_topic) and to the severity score normalized to [0, 1] (severity answers come back on a 0..3 scale and are divided by 3).",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Block Threshold",
+          "type": "number"
+        },
+        "fail_closed": {
+          "default": false,
+          "description": "When True, block content on Arbiter connection or response errors instead of failing open.",
+          "title": "Fail Closed",
+          "type": "boolean"
+        },
+        "model": {
+          "default": "auto",
+          "description": "Arbiter checkpoint routing hint passed to /v1/systemone.",
+          "title": "Model",
+          "type": "string"
+        },
+        "pii_threshold": {
+          "default": 0.5,
+          "description": "PII noul at or above which context['arbiter_pii_detected'] is set.",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Pii Threshold",
+          "type": "number"
+        },
+        "review_threshold": {
+          "default": 0.5,
+          "description": "Probability at or above which the message is escalated for review instead of allowed.",
+          "maximum": 1.0,
+          "minimum": 0.0,
+          "title": "Review Threshold",
+          "type": "number"
+        }
+      },
+      "title": "ArbiterConfig",
+      "type": "object"
+    },
     "AutoAlignOptions": {
       "description": "List of guardrails that are activated",
       "properties": {
@@ -1139,6 +1208,17 @@
         }
       ],
       "description": "Configuration for Cisco AI Defense."
+    },
+    "arbiter": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ArbiterConfig"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "Configuration for the Arbiter moderation rail."
     },
     "autoalign": {
       "$ref": "#/$defs/AutoAlignRailConfig",

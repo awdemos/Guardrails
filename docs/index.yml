@@ -140,6 +140,9 @@ navigation:
               - page: AlignScore
                 path: configure-rails/guardrail-catalog/community/alignscore.mdx
                 slug: alignscore
+              - page: Arbiter
+                path: configure-rails/guardrail-catalog/community/arbiter.mdx
+                slug: arbiter
               - page: AutoAlign
                 path: configure-rails/guardrail-catalog/community/auto-align.mdx
                 slug: auto-align

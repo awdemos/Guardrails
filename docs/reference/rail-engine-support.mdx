@@ -37,12 +37,12 @@ The following table summarizes surface support by direction:
 
 | Direction | Surfaces | LLMRails | IORails |
 |---|---:|---:|---:|
-| Input | 32 | 32 | 31 |
-| Output | 35 | 35 | 28 |
+| Input | 33 | 33 | 32 |
+| Output | 36 | 36 | 29 |
 | Retrieval | 11 | 11 | 0 |
 | Tool_output | 1 | 0 | 1 |
 | Tool_input | 1 | 0 | 1 |
-| **Total** | **80** | **78** | **61** |
+| **Total** | **82** | **80** | **63** |
 
 `IORails` does not accept a `rails.retrieval` section at all, so every retrieval surface is an `LLMRails` capability.
 A configuration that declares one routes to `LLMRails` by default.
@@ -62,6 +62,7 @@ The following table lists the input surfaces:
 | `activefence moderation on input detailed` | ActiveFence | ✓ | ✓ | |
 | `autoalign check input` | AutoAlign | ✓ | ✓ | Rewrites `user_message` |
 | `ai defense inspect prompt` | Cisco AI Defense | ✓ | ✓ | |
+| `arbiter moderation on input` | Arbiter | ✓ | ✓ | |
 | `clavata check input` | Clavata | ✓ | ✓ | |
 | `content safety check input` | Content Safety | ✓ | ✓ | |
 | `context bloat detection on input` | Context Bloat Detection | ✓ | ✓ | Rewrites `user_message` |
@@ -99,6 +100,7 @@ The following table lists the output surfaces:
 |---|---|:---:|:---:|---|
 | `activefence moderation on output` | ActiveFence | ✓ | ✓ | |
 | `alignscore check facts` | AlignScore Fact Checking | ✓ | ✗ | Reads `relevant_chunks` |
+| `arbiter moderation on output` | Arbiter | ✓ | ✓ | |
 | `autoalign check output` | AutoAlign | ✓ | ✓ | Rewrites `bot_message` |
 | `autoalign factcheck output` | AutoAlign | ✓ | ✓ | |
 | `autoalign groundedness output` | AutoAlign | ✓ | ✗ | Reads `relevant_chunks_sep` |

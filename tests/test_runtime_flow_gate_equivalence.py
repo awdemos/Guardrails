@@ -758,6 +758,20 @@ ACTIVEFENCE_INPUT_DETAILED = RailSpec(
     action="call_activefence_api",
 )
 
+ARBITER_INPUT = RailSpec(
+    name="arbiter_input",
+    flow="arbiter moderation on input",
+    direction="input",
+    action="arbiter_check_input",
+)
+
+ARBITER_OUTPUT = RailSpec(
+    name="arbiter_output",
+    flow="arbiter moderation on output",
+    direction="output",
+    action="arbiter_check_output",
+)
+
 GCP_MODERATION_INPUT = RailSpec(
     name="gcp_moderation_input",
     flow="gcpnlp moderation",
@@ -2274,6 +2288,33 @@ FIXTURES = [
         ObservableOutcome.EXCEPTION,
         FlowDecision.BLOCK,
         enable_rails_exceptions=True,
+    ),
+    _case(
+        "arbiter_input_allows_outcome_allow",
+        ARBITER_INPUT,
+        RailOutcome.allow(metadata={"arbiter_scores": {"jailbreak": 0.01}}),
+        ObservableOutcome.ALLOW,
+        FlowDecision.ALLOW,
+    ),
+    _case(
+        "arbiter_input_blocks_outcome_block",
+        ARBITER_INPUT,
+        RailOutcome.block(
+            reason="Arbiter moderation triggered.",
+            metadata={"policy_violations": ["harmful"]},
+        ),
+        ObservableOutcome.REFUSAL,
+        FlowDecision.BLOCK,
+    ),
+    _case(
+        "arbiter_output_escalates_review_band",
+        ARBITER_OUTPUT,
+        RailOutcome.block(
+            reason="Arbiter review band.",
+            metadata={"escalated": True, "review_signals": ["jailbreak"]},
+        ),
+        ObservableOutcome.REFUSAL,
+        FlowDecision.BLOCK,
     ),
     _case(
         "activefence_input_detailed_allows_at_adult_content_threshold",

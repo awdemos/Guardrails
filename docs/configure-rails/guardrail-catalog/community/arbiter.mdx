@@ -1,0 +1,99 @@
+---
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+title: "Arbiter Integration"
+---
+The NVIDIA NeMo Guardrails library supports using [Arbiter](https://github.com/NVIDIA/arbiter) as an input and output rail out-of-the-box. Arbiter is a local sidecar that wraps the Laya typed-decision model: you send it a piece of text and a set of typed questions, and it answers every question in a single batched forward pass in tens of milliseconds. Because the sidecar runs inference locally, no message text leaves your machine.
+
+## Prerequisites
+
+Run the Arbiter sidecar on the same host as your guardrails application. The default address is `http://localhost:8010`; override it with the `ARBITER_URL` environment variable. If the sidecar was started with an API key, set `ARBITER_API_KEY` and the rail sends it as a Bearer token.
+
+```bash
+./run.sh serve            # or the equivalent docker run command
+curl -s http://localhost:8010/readyz
+```
+
+Poll `/readyz` until it reports `{"status": "ready"}`; the sidecar returns 503 while it loads its checkpoints.
+
+## Configuration
+
+Enable the rail in `config.yml`:
+
+```yaml
+rails:
+  input:
+    flows:
+      - arbiter moderation on input
+
+  output:
+    flows:
+      - arbiter moderation on output
+```
+
+Each run makes one batched call to `/v1/systemone` with five questions about the message: jailbreak, harmful, PII, and off-topic nouls (a noul is Arbiter's boolean-answer question type; its answer is the probability, between 0 and 1, that the statement holds) plus a severity score. The answers map onto three decision bands:
+
+| Band | Condition | Behavior |
+|---|---|---|
+| Allow | every risk signal below `review_threshold` | `RailOutcome.allow` |
+| Escalate | any risk signal at or above `review_threshold` but none at or above `block_threshold` | `RailOutcome.block` with `metadata["escalated"] = True` and `context["arbiter_escalated"] = True` |
+
+Every outcome also carries `metadata["band"]` set to `"block"`, `"escalate"`, or `"allow"`. The escalate band intentionally surfaces as a blocked outcome because that is the Guardrails contract for stopping the default path: flows branch on `is_blocked`. A flow can distinguish the bands via `metadata["escalated"]` and hand escalated messages to a self check rail.
+| Block | any risk signal at or above `block_threshold` | `RailOutcome.block` with `metadata["policy_violations"]` |
+
+PII is handled separately: it never blocks on its own, but when the PII noul reaches `pii_threshold` the rail sets `context["arbiter_pii_detected"] = True` so you can redact before logging or storing, and it counts toward the escalate band.
+
+The severity answer comes back on a 0..3 scale (harmless to dangerous or illegal); the rail normalizes it to [0, 1] by dividing by 3 and clamps the result, then compares it against the same thresholds as the nouls.
+
+Tune the thresholds under `rails.config`:
+
+```yaml
+rails:
+  config:
+    arbiter:
+      block_threshold: 0.9
+      review_threshold: 0.5
+      pii_threshold: 0.5
+      fail_closed: false
+      model: auto
+```
+
+`fail_closed` defaults to `false`: when the sidecar is unreachable or returns a malformed response, the rail logs a warning and allows the message. Set it to `true` to block content on Arbiter connection or response errors instead of failing open.
+
+## Escalating to self check rails
+
+The escalate band stops the default response path, which makes it a natural hand-off point for a more deliberate check. Override the flow in your config to route escalated messages to a self check rail while letting outright blocks refuse:
+
+```text
+define subflow arbiter moderation on input
+  $result = execute arbiter_check_input(user_message=$user_message)
+
+  if $result.is_blocked
+    if $result.metadata.get("escalated")
+      $check = execute self check input
+      if $check.is_blocked
+        bot refuse to respond
+        stop
+    else
+      bot refuse to respond
+      stop
+```
+
+## Streaming
+
+Output rails run on buffered chunks, so the sidecar check runs once the full response is assembled. Arbiter latency is low (tens of milliseconds per batched call), but if you need the fastest streaming path you can disable streaming or drop the output rail.
+
+<Note title="Colang 2.x">
+In Colang 2.x configurations, import the library in your Colang file so the flows resolve:
+
+```text
+import nemoguardrails.library
+
+flow input rails $input_text
+    arbiter moderation on input
+```
+</Note>
+
+## Calibration caveat
+
+Base Arbiter checkpoints ship over-confident: out of the box, nouls tend to sit closer to 0 or 1 than the true risk warrants. Start with generous thresholds and calibrate them on your own traffic before relying on the block band in production.

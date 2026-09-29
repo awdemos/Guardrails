@@ -1,0 +1,21 @@
+define subflow arbiter moderation on input
+  """Guardrail based on the Arbiter allow / escalate / block bands."""
+  $result = execute arbiter_check_input(user_message=$user_message)
+
+  if $result.is_blocked
+    if $config.enable_rails_exceptions
+      create event ArbiterModerationRailException(message=$result.reason)
+    else
+      bot refuse to respond
+    stop
+
+define subflow arbiter moderation on output
+  """Guardrail based on the Arbiter allow / escalate / block bands."""
+  $result = execute arbiter_check_output(bot_message=$bot_message)
+
+  if $result.is_blocked
+    if $config.enable_rails_exceptions
+      create event ArbiterModerationRailException(message=$result.reason)
+    else
+      bot refuse to respond
+    stop

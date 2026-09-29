@@ -1,0 +1,21 @@
+flow arbiter moderation on input
+  """Guardrail based on the Arbiter allow / escalate / block bands."""
+  $result = await ArbiterCheckInputAction(user_message=$user_message)
+
+  if $result.is_blocked
+    if $system.config.enable_rails_exceptions
+      send ArbiterModerationRailException(message=$result.reason)
+    else
+      bot refuse to respond
+    abort
+
+flow arbiter moderation on output
+  """Guardrail based on the Arbiter allow / escalate / block bands."""
+  $result = await ArbiterCheckOutputAction(bot_message=$bot_message)
+
+  if $result.is_blocked
+    if $system.config.enable_rails_exceptions
+      send ArbiterModerationRailException(message=$result.reason)
+    else
+      bot refuse to respond
+    abort
