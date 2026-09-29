@@ -49,6 +49,10 @@ class StubRail:
         self.call_count += 1
         return RailExecution(outcome=self.outcome)
 
+    def with_runtime_dependencies(self, deps: Any) -> "StubRail":
+        """Model dependency finalization while retaining this behavior-only test double."""
+        return self
+
     async def close(self) -> None:
         """A compiled rail may own an HTTP client; a stub has nothing to release."""
 
@@ -73,6 +77,14 @@ def user_message_rewrite(text: str) -> RailResult:
 def bot_message_rewrite(text: str) -> RailResult:
     """The verdict output rails return when they rewrote the response to *text*."""
     return RailResult(RailOutcome.transform([(TransformTarget.BOT_MESSAGE, text)]))
+
+
+def rail_failure(rail: str) -> RailResult:
+    """The verdict the fail-closed envelope returns when *rail* raised instead of deciding."""
+    return RailResult(
+        RailOutcome.failure(reason=f"{rail} error: provider call failed"),
+        triggered_rail=rail,
+    )
 
 
 @contextmanager

@@ -34,16 +34,20 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.exceptions import ExceptionMiddleware
 from starlette.responses import JSONResponse, RedirectResponse, StreamingResponse
 
-from nemoguardrails import LLMRails, RailsConfig, utils
+from nemoguardrails import Guardrails, LLMRails, RailsConfig, utils
 from nemoguardrails.exceptions import (
     InvalidModelConfigurationError,
     InvalidStateError,
     LLMCallException,
+    NonStreamingWorkQueueFullError,
     RailTypeNotConfiguredError,
+    StreamingCapacityExceededError,
     StreamingNotSupportedError,
 )
+from nemoguardrails.guardrails.iorails import IORails
 from nemoguardrails.guardrails.model_engine import ModelEngineError
 from nemoguardrails.http.errors import HTTPClientError
+from nemoguardrails.llm.call import _prepend_think_tags
 from nemoguardrails.llm.clients._errors import build_error_payload, normalize_error_status
 from nemoguardrails.llm.models.initializer import ModelInitializationError
 from nemoguardrails.rails.llm.config import Model
@@ -56,9 +60,12 @@ from nemoguardrails.server.exception_handlers import (
     invalid_state_error_handler,
     llm_call_exception_handler,
     model_initialization_error_handler,
+    queue_full_error_handler,
     rail_type_not_configured_error_handler,
+    streaming_capacity_error_handler,
     validation_error_handler,
 )
+from nemoguardrails.server.metrics import shutdown_metrics_exporter, start_metrics_exporter
 from nemoguardrails.server.schemas.openai import (
     GuardrailCheckRequest,
     GuardrailCheckResponse,
@@ -110,36 +117,6 @@ class GuardrailsApp(FastAPI):
 registered_loggers: List[Callable] = []
 
 
-def _raise_invalid_state(detail: str) -> None:
-    raise HTTPException(status_code=422, detail=detail)
-
-
-def _validate_public_state_shape(state: Optional[dict]) -> None:
-    """Validate request state shape before loading rails config.
-
-    At the public HTTP boundary, the only accepted non-empty dict state shape is
-    Colang 1.0 transcript state: {"events": [...]}. Colang 2.0 has no safe
-    public dict state shape.
-    """
-    if state is None or state == {}:
-        return
-
-    if state.get("version") == "2.x" or "state" in state:
-        _raise_invalid_state(
-            "Caller-supplied state is not accepted for Colang 2.0 over HTTP. "
-            "Full Colang 2.0 flow-state continuation over HTTP is not currently supported."
-        )
-
-    if "events" not in state:
-        _raise_invalid_state(
-            "Invalid state format: state must contain an 'events' key. "
-            "Use an empty dict {} to start a new conversation."
-        )
-
-    if not isinstance(state["events"], list):
-        _raise_invalid_state("Invalid state format: 'events' must be a list.")
-
-
 api_description = """Guardrails Server API."""
 
 # The headers for each request
@@ -154,12 +131,30 @@ datastore: Optional[DataStore] = None
 
 @asynccontextmanager
 async def lifespan(app: GuardrailsApp):
-    # Startup logic here
-    """Register any additional challenges, if available at startup."""
+    """Run the server lifespan inside the metrics exporter's lifetime.
+
+    The exporter starts before anything can construct a rails instance so the
+    first IORails metric lands on a real MeterProvider (a no-op unless
+    NEMO_GUARDRAILS_SERVER_METRICS_EXPORTER is set, idempotent when the CLI
+    already started it) and is released even when startup fails inside
+    :func:`_server_lifespan`, for example on a malformed challenges.json.
+    """
     from nemoguardrails.telemetry import DeploymentTypeEnum, set_deployment_type
 
     set_deployment_type(DeploymentTypeEnum.API.value)
 
+    start_metrics_exporter()
+    try:
+        async with _server_lifespan(app):
+            yield
+    finally:
+        shutdown_metrics_exporter()
+
+
+@asynccontextmanager
+async def _server_lifespan(app: GuardrailsApp):
+    # Startup logic here
+    """Register any additional challenges, if available at startup."""
     challenges_files = os.path.join(app.rails_config_path, "challenges.json")
 
     if os.path.exists(challenges_files):
@@ -206,8 +201,6 @@ async def lifespan(app: GuardrailsApp):
         if hasattr(app, "task") and app.task is not None:
             app.task.cancel()
         log.info("Shutting down file observer")
-    else:
-        pass
 
 
 app = GuardrailsApp(
@@ -219,6 +212,12 @@ app = GuardrailsApp(
 )
 
 _EXCEPTION_HANDLERS = (
+    # The streaming limit is a semaphore rather than a queue, so it is not a
+    # QueueFull at all and carries its own handler.
+    (StreamingCapacityExceededError, streaming_capacity_error_handler),
+    (NonStreamingWorkQueueFullError, queue_full_error_handler),
+    # Any QueueFull raised outside the paths above still reads as overload.
+    (asyncio.QueueFull, queue_full_error_handler),
     (LLMCallException, llm_call_exception_handler),
     (ModelEngineError, llm_call_exception_handler),
     (HTTPClientError, llm_call_exception_handler),
@@ -616,6 +615,37 @@ def process_chunk(chunk: Any) -> Union[Any, ChunkError]:
     return chunk
 
 
+def _inline_reasoning_as_think_tags(res: GenerationResponse) -> GenerationResponse:
+    """Move `reasoning_content` into the assistant message as a <think> prefix and clear the field."""
+    if not res.reasoning_content:
+        return res
+    if not isinstance(res.response, list):
+        return res
+
+    inlined = False
+    for message in res.response:
+        if message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        # IORails only strips inline tags when the provider gave no structured reasoning
+        # (`response.reasoning or _extract_and_remove_think_tags(...)`), so a provider that
+        # sends both leaves a block already in the content; prepending would duplicate it.
+        # TODO: this pattern is copied from `_extract_and_remove_think_tags` in
+        # nemoguardrails/llm/call.py; factor the two onto one shared matcher.
+        if re.search(r"<think>(.*?)</think>", content, re.DOTALL):
+            continue
+        message["content"] = _prepend_think_tags(content, res.reasoning_content)
+        inlined = True
+
+    # A tool-call-only message has `content=None`, so there is nowhere to put the
+    # trace; keep the field rather than dropping the reasoning on the floor.
+    if inlined:
+        res.reasoning_content = None
+    return res
+
+
 @app.post(
     "/v1/chat/completions",
     response_model=GuardrailsChatCompletion,
@@ -648,8 +678,6 @@ async def chat_completion(body: GuardrailsChatCompletionRequest, request: Reques
                 detail="No guardrails config_id provided and server has no default configuration",
             )
 
-    _validate_public_state_shape(body.guardrails.state)
-
     try:
         llm_rails = await _get_rails(config_ids, model_name=body.model)
 
@@ -659,16 +687,6 @@ async def chat_completion(body: GuardrailsChatCompletionRequest, request: Reques
             status_code=400,
             detail=f"Could not load the requested guardrails configuration: {config_ids}",
         )
-
-    # Version-aware state validation, now that the config is loaded.
-    # 1.0 accepts the pre-validated {"events": [...]} transcript. 2.0 has no
-    # valid public dict state shape.
-    if body.guardrails.state is not None and body.guardrails.state != {}:
-        if llm_rails.config.colang_version != "1.0":
-            raise HTTPException(
-                status_code=422,
-                detail="Stateful continuation over HTTP is not supported for Colang 2.0.",
-            )
 
     if body.guardrails.thread_id and llm_rails.config.colang_version != "1.0":
         raise HTTPException(
@@ -741,7 +759,6 @@ async def chat_completion(body: GuardrailsChatCompletionRequest, request: Reques
         stream_iterator = llm_rails.stream_async(
             messages=messages,
             options=generation_options,
-            state=body.guardrails.state,
         )
 
         try:
@@ -778,8 +795,17 @@ async def chat_completion(body: GuardrailsChatCompletionRequest, request: Reques
         res = await llm_rails.generate_async(
             messages=messages,
             options=generation_options,
-            state=body.guardrails.state,
         )
+
+        # IORails-only: prefix `content` with `reasoning_content` and think-tags.
+        # A Guardrails wrapper can fall back to an LLMRails engine, which already
+        # inlines reasoning itself, so the engine check is what scopes this.
+        if (
+            isinstance(llm_rails, Guardrails)
+            and isinstance(llm_rails.rails_engine, IORails)
+            and isinstance(res, GenerationResponse)
+        ):
+            res = _inline_reasoning_as_think_tags(res)
 
         # Extract bot message for thread storage if needed
         bot_message = extract_bot_message_from_response(res)

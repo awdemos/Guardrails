@@ -38,11 +38,10 @@ from nemoguardrails.guardrails.guardrails_types import (
 )
 from nemoguardrails.guardrails.telemetry import mark_rail_stop, rail_span, set_rail_content
 from nemoguardrails.guardrails.tool_rail_action import ToolRailAction
-from nemoguardrails.guardrails.tool_schema import ToolExchange, Toolset
+from nemoguardrails.guardrails.tool_schema import Tool, ToolExchange, ToolResult, Toolset
 from nemoguardrails.http.runtime import create_http_client
 from nemoguardrails.llm.taskmanager import LLMTaskManager
 from nemoguardrails.manifests import RailDirection as SurfaceDirection
-from nemoguardrails.manifests import parse_configured_surface
 from nemoguardrails.rails.llm.config import _get_flow_model, _get_flow_name
 from nemoguardrails.types import ToolCall, UsageInfo
 
@@ -71,82 +70,6 @@ _TOOL_ACTION_CLASSES: dict[str, type[ToolRailAction]] = {
 }
 
 _ToolActionT = TypeVar("_ToolActionT", bound=ToolRailAction)
-
-# Integrations requiring API calls (rather than LLM inference). They should wrap
-# plain http_client with server-side retry, timeout, max_attempts requirements
-# TODO: Encode these in RailManifest
-_HTTP_CLIENT_SURFACE_NAMES: frozenset[str] = frozenset(
-    {
-        # activefence
-        "activefence moderation on input",
-        "activefence moderation on input detailed",
-        "activefence moderation on output",
-        # ai_defense
-        "ai defense inspect prompt",
-        "ai defense inspect response",
-        # autoalign
-        "autoalign check input",
-        "autoalign check output",
-        "autoalign factcheck output",
-        "autoalign groundedness output",
-        # clavata
-        "clavata check input",
-        "clavata check output",
-        # crowdstrike_aidr
-        "crowdstrike aidr guard input",
-        "crowdstrike aidr guard output",
-        # f5
-        "f5 guardrails scan input",
-        "f5 guardrails scan output",
-        # fiddler
-        "fiddler bot faithfulness",
-        "fiddler bot safety",
-        "fiddler user safety",
-        # gliner
-        "gliner detect pii on input",
-        "gliner detect pii on output",
-        "gliner detect pii on retrieval",
-        "gliner mask pii on input",
-        "gliner mask pii on output",
-        "gliner mask pii on retrieval",
-        # hf_classifier
-        "hf classifier check input",
-        "hf classifier check output",
-        "hf classifier check retrieval",
-        # jailbreak_detection
-        "jailbreak detection heuristics",
-        "jailbreak detection model",
-        # pangea
-        "pangea ai guard input",
-        "pangea ai guard output",
-        # patronusai
-        "patronus api check output",
-        # policyai
-        "policyai moderation on input",
-        "policyai moderation on output",
-        # polygraf
-        "polygraf detect pii on input",
-        "polygraf detect pii on output",
-        "polygraf detect pii on retrieval",
-        "polygraf mask pii on input",
-        "polygraf mask pii on output",
-        "polygraf mask pii on retrieval",
-        # privateai
-        "detect pii on input",
-        "detect pii on output",
-        "detect pii on retrieval",
-        "mask pii on input",
-        "mask pii on output",
-        "mask pii on retrieval",
-        # prompt_security
-        "protect prompt",
-        "protect response",
-        # trend_micro
-        "trend ai guard input",
-        "trend ai guard output",
-    }
-)
-
 
 # The conversation variable each direction's rails may rewrite; anything else is refused.
 _REWRITABLE_TARGET = {
@@ -227,7 +150,9 @@ def _result_after_rewrites(
     return RailResult(RailOutcome.transform([(_REWRITABLE_TARGET[direction], final_text)]), records=records)
 
 
-def _model_free_record(flow: str, rail_type: str, result: RailResult) -> RailCallRecord:
+def _model_free_record(
+    flow: str, rail_type: str, result: RailResult, tool_name: Optional[str] = None
+) -> RailCallRecord:
     """Build the per-rail GenerationLog record for a rail that reached no model."""
     base_name = _get_flow_name(flow) or flow
     model = _get_flow_model(flow)
@@ -240,6 +165,7 @@ def _model_free_record(flow: str, rail_type: str, result: RailResult) -> RailCal
         action_name=action_name,
         return_value=result.return_value,
         task=f"{action_name} $model={model}" if model else action_name,
+        tool_name=tool_name,
     )
 
 
@@ -265,10 +191,14 @@ def _merge_llm_call_info(record: RailCallRecord, call: "LLMCallInfo") -> RailCal
 
 
 def _rail_call_record(
-    flow: str, rail_type: str, result: RailResult, calls: Sequence["LLMCallInfo"] = ()
+    flow: str,
+    rail_type: str,
+    result: RailResult,
+    calls: Sequence["LLMCallInfo"] = (),
+    tool_name: Optional[str] = None,
 ) -> RailCallRecord:
     """Build the per-rail GenerationLog record from a rail's result and the calls it made."""
-    record = _model_free_record(flow, rail_type, result)
+    record = _model_free_record(flow, rail_type, result, tool_name)
     if not calls:
         return record
     if len(calls) > 1:
@@ -291,6 +221,8 @@ class RailsManager:
         output_parallel: bool = False,
         tool_call_flows: Optional[list[str]] = None,
         tool_result_flows: Optional[list[str]] = None,
+        per_tool_call_flows: Optional[dict[str, list[str]]] = None,
+        per_tool_result_flows: Optional[dict[str, list[str]]] = None,
         tracer: Optional["Tracer"] = None,
         content_capture_enabled: bool = False,
     ) -> None:
@@ -310,6 +242,8 @@ class RailsManager:
 
         self.tool_call_flows: list[str] = list(tool_call_flows or [])
         self.tool_result_flows: list[str] = list(tool_result_flows or [])
+        self.per_tool_call_flows: dict[str, list[str]] = dict(per_tool_call_flows or {})
+        self.per_tool_result_flows: dict[str, list[str]] = dict(per_tool_result_flows or {})
 
         deps = self._rail_dependencies()
         # Keyed by direction as well as flow: compilation is direction-specific, so a surface
@@ -319,14 +253,7 @@ class RailsManager:
         configured = ((RailDirection.INPUT, self.input_flows), (RailDirection.OUTPUT, self.output_flows))
         for direction, flows in configured:
             for flow in flows:
-                try:
-                    surface_name, _ = parse_configured_surface(flow)
-                except ValueError:
-                    surface_name = flow
-                http_client = create_http_client() if surface_name in _HTTP_CLIENT_SURFACE_NAMES else None
-                self._rails[(direction, flow)] = compile_rail(
-                    flow, _SURFACE_DIRECTIONS[direction], deps, http_client=http_client
-                )
+                self._rails[(direction, flow)] = compile_rail(flow, _SURFACE_DIRECTIONS[direction], deps)
 
         # Which rails may rewrite decides whether this config can run its rails concurrently at
         # all, which is settled once, here. The order they run in is not: it follows from the
@@ -341,6 +268,23 @@ class RailsManager:
         # Tool Result Actions run on the results of executing Tool Calls in the harness
         self._tool_call_actions = self._build_tool_actions(self.tool_call_flows, ToolCallRailAction)
         self._tool_result_actions = self._build_tool_actions(self.tool_result_flows, ToolResultRailAction)
+
+        self._per_tool_rails: dict[tuple[SurfaceDirection, str], CompiledRail] = {}
+        per_tool_configured = (
+            (SurfaceDirection.TOOL_OUTPUT, self.per_tool_call_flows),
+            (SurfaceDirection.TOOL_INPUT, self.per_tool_result_flows),
+        )
+        for direction, per_tool in per_tool_configured:
+            unique_flows = {flow for flows in per_tool.values() for flow in flows}
+            for flow in unique_flows:
+                self._per_tool_rails[(direction, flow)] = compile_rail(flow, direction, deps)
+
+        self._http_client = create_http_client()
+        runtime_deps = replace(deps, http_client=self._http_client)
+        self._rails = {key: rail.with_runtime_dependencies(runtime_deps) for key, rail in self._rails.items()}
+        self._per_tool_rails = {
+            key: rail.with_runtime_dependencies(runtime_deps) for key, rail in self._per_tool_rails.items()
+        }
 
         log.info(
             "RailsManager initialized: input_flows=%s, output_flows=%s, tool_call_flows=%s, "
@@ -377,23 +321,8 @@ class RailsManager:
         )
 
     async def stop(self) -> None:
-        """Close the HTTP clients owned by compiled rails.
-
-        Every rail is closed even if an earlier one fails, so one stuck client cannot
-        leak the pools behind it; the failures are reported together afterwards.
-        Repeat calls are safe, because a closed client's ``close()`` is a no-op.
-        """
-        errors: dict[str, Exception] = {}
-        for (direction, flow), rail in self._rails.items():
-            try:
-                await rail.close()
-            except Exception as e:
-                errors[f"{direction.value} rail '{flow}'"] = e
-                log.error("Error closing the HTTP client for %s rail '%s': %s", direction.value, flow, e)
-
-        if errors:
-            error_string = ", ".join(f"{component}: exception {exception}" for component, exception in errors.items())
-            raise RuntimeError(f"Failed to close rail HTTP clients: {error_string}")
+        """Close the runtime-owned pooled HTTP client."""
+        await self._http_client.close()
 
     def _build_tool_actions(self, flows: list[str], expected_cls: type[_ToolActionT]) -> dict[str, _ToolActionT]:
         """Instantiate the tool rails for *flows*, checking each resolves to *expected_cls*.
@@ -469,17 +398,46 @@ class RailsManager:
         (``tool_calls``) plus the request's declared tools (``llm_params``) and returns
         a ``RailResult``.
         """
-        active = self._enabled_flows(list(self._tool_call_actions), enabled)
-        if not active or not tool_calls:
+        if not tool_calls:
             return RailResult.allow()
+
+        active = self._enabled_flows(list(self._tool_call_actions), enabled)
+        enabled_per_tool_flows = {
+            flow for flows in self.per_tool_call_flows.values() for flow in self._enabled_flows(flows, enabled)
+        }
+        if not active and not enabled_per_tool_flows:
+            return RailResult.allow()
+
+        global_result = RailResult.allow()
         try:
             toolset = self.engine_registry.parse_tools(model_type, llm_params)
         except Exception as e:
             log.warning("[%s] tool parsing failed; blocking tool calls: %s", get_request_id(), e)
             return RailResult.block(reason=f"tool parsing failed: {e}")
 
-        rails = {flow: self._run_tool_call_rail(flow, tool_calls, toolset) for flow in active}
-        return await self._run_tool_rails_sequential(rails, RailDirection.OUTPUT)
+        if active:
+            rails = {flow: self._run_tool_call_rail(flow, tool_calls, toolset) for flow in active}
+            global_result = await self._run_tool_rails_sequential(rails, RailDirection.OUTPUT)
+            if not global_result.is_safe:
+                return global_result
+
+        per_tool_rails = {}
+        for index, tool_call in enumerate(tool_calls):
+            tool_name = tool_call.function.name or tool_call.type
+            flows = self._enabled_flows(self.per_tool_call_flows.get(tool_name, []), enabled)
+            tool_definition = toolset.get(tool_name)
+            for flow in flows:
+                per_tool_rails[f"{index}:{flow}"] = self._run_per_tool_rail(
+                    SurfaceDirection.TOOL_OUTPUT, flow, tool_call=tool_call, tool_definition=tool_definition
+                )
+        if not per_tool_rails:
+            return global_result
+
+        per_tool_result = await self._run_tool_rails_sequential(per_tool_rails, RailDirection.OUTPUT)
+        combined_records = tuple(global_result.records) + tuple(per_tool_result.records)
+        if not per_tool_result.is_safe:
+            return replace(per_tool_result, records=combined_records)
+        return RailResult.allow(records=combined_records)
 
     async def are_tool_results_safe(
         self,
@@ -497,7 +455,10 @@ class RailsManager:
         not flagged as ambiguous duplicates.
         """
         active = self._enabled_flows(list(self._tool_result_actions), enabled)
-        if not active:
+        enabled_per_tool_flows = {
+            flow for flows in self.per_tool_result_flows.values() for flow in self._enabled_flows(flows, enabled)
+        }
+        if not active and not enabled_per_tool_flows:
             return RailResult.allow()
         try:
             exchanges = self.engine_registry.extract_tool_exchanges(model_type, messages)
@@ -507,8 +468,43 @@ class RailsManager:
         if not any(exchange.results for exchange in exchanges):
             return RailResult.allow()
 
-        rails = {flow: self._run_tool_result_rail(flow, exchanges) for flow in active}
-        return await self._run_tool_rails_sequential(rails, RailDirection.INPUT)
+        global_result = RailResult.allow()
+        if active:
+            rails = {flow: self._run_tool_result_rail(flow, exchanges) for flow in active}
+            global_result = await self._run_tool_rails_sequential(rails, RailDirection.INPUT)
+            if not global_result.is_safe:
+                return global_result
+
+        if not enabled_per_tool_flows:
+            # No per-tool policy needs this result's identity; don't override a global rail
+            # that may tolerate an orphan/unresolved result.
+            return global_result
+
+        result_items = [(exchange, tool_result) for exchange in exchanges for tool_result in exchange.results]
+        per_tool_rails = {}
+        for index, (exchange, tool_result) in enumerate(result_items):
+            matched_call = self._resolve_tool_call_for_result(exchange, tool_result)
+            if matched_call is None:
+                # Fail closed: a per-tool policy is enabled but this result's identity is
+                # unverifiable, so which policy applies can't be known.
+                return RailResult.block(
+                    reason="tool result cannot be linked to exactly one prior call; per-tool policy cannot be verified",
+                    records=global_result.records,
+                )
+            tool_name = matched_call.function.name or matched_call.type
+            flows = self._enabled_flows(self.per_tool_result_flows.get(tool_name, []), enabled)
+            for flow in flows:
+                per_tool_rails[f"{index}:{flow}"] = self._run_per_tool_rail(
+                    SurfaceDirection.TOOL_INPUT, flow, tool_call=matched_call, tool_result=tool_result
+                )
+        if not per_tool_rails:
+            return global_result
+
+        per_tool_result = await self._run_tool_rails_sequential(per_tool_rails, RailDirection.INPUT)
+        combined_records = tuple(global_result.records) + tuple(per_tool_result.records)
+        if not per_tool_result.is_safe:
+            return replace(per_tool_result, records=combined_records)
+        return RailResult.allow(records=combined_records)
 
     def _flows_to_run(
         self, direction: RailDirection, configured: list[str], enabled: Union[bool, list[str]]
@@ -529,6 +525,20 @@ class RailsManager:
             return []
         requested = {_get_flow_name(name) or name for name in enabled}
         return [flow for flow in configured if (_get_flow_name(flow) or flow) in requested]
+
+    @staticmethod
+    def _resolve_tool_call_for_result(exchange: ToolExchange, tool_result: ToolResult) -> Optional[ToolCall]:
+        """The prior call a result belongs to, resolved by call id, or None if unresolvable.
+
+        ``tool_result.name`` is caller-supplied and untrusted for policy selection: a client
+        could claim a different (or no) tool to dodge that tool's configured checks. Only a
+        call id that resolves to exactly one prior call identifies the tool; an unresolved
+        or ambiguous call id resolves to None, never to the supplied name.
+        """
+        matching_calls = [call for call in exchange.calls if call.id == tool_result.call_id]
+        if len(matching_calls) == 1:
+            return matching_calls[0]
+        return None
 
     async def _run_rail(
         self,
@@ -595,6 +605,39 @@ class RailsManager:
                             {"call_id": r.call_id, "name": r.name, "is_error": r.is_error} for r in all_results
                         ]
                     },
+                    reason=display_reason(result) if not result.is_safe else None,
+                )
+            return result
+
+    async def _run_per_tool_rail(
+        self,
+        direction: SurfaceDirection,
+        flow: str,
+        tool_call: ToolCall,
+        tool_result: Optional[ToolResult] = None,
+        tool_definition: Optional[Tool] = None,
+    ) -> RailResult:
+        """Dispatch one per-tool rail, passing the resolved ToolCall/ToolResult/Tool through."""
+        tool_name = tool_call.function.name or tool_call.type
+        rail_direction = RailDirection.OUTPUT if direction == SurfaceDirection.TOOL_OUTPUT else RailDirection.INPUT
+        rail_type = "tool_output" if direction == SurfaceDirection.TOOL_OUTPUT else "tool_input"
+        with rail_span(self._tracer, flow, rail_direction) as span:
+            rail_execution = await self._per_tool_rails[(direction, flow)].execute(
+                [], tool_call=tool_call, tool_result=tool_result, tool_definition=tool_definition
+            )
+            result = _rail_result(rail_execution.outcome)
+            if not result.is_safe:
+                result = replace(result, triggered_rail=_get_flow_name(flow) or flow)
+            record = _rail_call_record(flow, rail_type, result, rail_execution.llm_calls, tool_name=tool_name)
+            result = replace(result, records=(record,))
+            mark_rail_stop(span, result.is_safe)
+            if self._content_capture_enabled:
+                content: dict[str, Any] = {"tool_name": tool_name, "tool_call": tool_call.to_dict()}
+                if tool_result is not None:
+                    content["tool_result"] = tool_result.to_dict()
+                set_rail_content(
+                    span,
+                    content,
                     reason=display_reason(result) if not result.is_safe else None,
                 )
             return result

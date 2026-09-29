@@ -445,6 +445,10 @@ class ToolOutputRails(BaseModel):
         default_factory=list,
         description="The names of all the flows that implement tool output rails.",
     )
+    per_tool: Dict[str, List[str]] = Field(
+        default_factory=dict,
+        description="Per-tool flows, keyed by tool name. Supplements the global `flows`, which run for every tool call.",
+    )
     parallel: Optional[bool] = Field(
         default=False,
         description="If True, the tool output rails are executed in parallel.",
@@ -461,6 +465,10 @@ class ToolInputRails(BaseModel):
     flows: List[str] = Field(
         default_factory=list,
         description="The names of all the flows that implement tool input rails.",
+    )
+    per_tool: Dict[str, List[str]] = Field(
+        default_factory=dict,
+        description="Per-tool flows, keyed by tool name. Supplements the global `flows`, which run for every tool result.",
     )
     parallel: Optional[bool] = Field(
         default=False,
@@ -1258,6 +1266,11 @@ class RailsConfig(BaseModel):
 
         Supports loading a from a single file, or from a directory.
         """
+        if "," in config_path or config_path != config_path.strip():
+            raise ValueError(
+                f"Invalid config path {config_path!r}. Paths cannot contain commas or begin or end with whitespace."
+            )
+
         # If the config path is a file, we load the YAML content.
         # Otherwise, if it's a folder, we iterate through all files.
         if os.path.isfile(config_path) and config_path.endswith((".yaml", ".yml")):

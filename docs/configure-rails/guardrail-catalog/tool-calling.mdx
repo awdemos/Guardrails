@@ -96,7 +96,9 @@ For each request, IORails runs the rails in the following order:
 4. **Output rails** on the text response.
    A response that contains only tool calls and no text skips the text output rails.
 
-When any rail blocks, IORails returns the refusal message `I'm sorry, I can't respond to that.` for a non-streaming request, and a `guardrails_violation` error payload for a streaming request.
+When a rail blocks, IORails returns the refusal message `I'm sorry, I can't respond to that.` for a non-streaming request, and a `guardrails_violation` error payload for a streaming request.
+When a rail cannot reach a verdict at all, because its provider rejected the credentials or was unreachable, the turn still stops, but the non-streaming message is `I'm sorry, an internal error has occurred.` instead.
+That distinction lets a caller tell a provider outage, which is worth retrying, from a policy decision, which is not.
 
 ## Enable the IORails Engine
 
@@ -308,6 +310,16 @@ The rail blocks the request when a tool result:
     linkage check verifies intra-request consistency, not server-verified
     provenance.
 </Note>
+
+<Warning>
+    Every tool result must carry a `tool_call_id` that matches a tool call still
+    present earlier in the same request's conversation history. If your
+    application truncates or prunes older turns (for example a sliding context
+    window), and a truncated turn held the call a later result answers, that
+    result becomes unresolvable. With a per-tool policy enabled
+    (`rails.tool_input.per_tool`), an unresolvable result fails closed and blocks
+    the request, since which policy applies can no longer be verified.
+</Warning>
 
 ## Control Rails per Request
 

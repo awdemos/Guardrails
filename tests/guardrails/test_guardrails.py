@@ -20,6 +20,7 @@ class correctly delegates method calls with properly formatted parameters.
 """
 
 import json
+import logging
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -57,12 +58,12 @@ _LLMRAILS_ONLY_INPUT_REASON = (
     "'jailbreak detection heuristics' Conflates dependencies with 'jailbreak detection model', "
     "so IORails cannot tell whether it needs 'torch' and 'transformers' installed"
 )
-# Chosen from the retrieval-evidence group for needing no prompt template of its own, so a
-# config built for a routing test does not have to carry one.
-_LLMRAILS_ONLY_OUTPUT_FLOW = "alignscore check facts"
+# Chosen from the surfaces that still require retrieval evidence unavailable to IORails.
+_LLMRAILS_ONLY_OUTPUT_FLOW = "self check facts"
 _LLMRAILS_ONLY_OUTPUT_REASON = (
-    "'alignscore check facts' needs retrieval evidence, which manifest-driven execution does not supply yet"
+    "'self check facts' needs context variable(s) 'relevant_chunks', which IORails does not supply"
 )
+_LLMRAILS_ONLY_OUTPUT_PROMPT = {"task": "self_check_facts", "content": "placeholder"}
 
 
 def _make_iorails_config(rails: dict, extra_prompts: list | None = None) -> RailsConfig:
@@ -99,6 +100,25 @@ def mock_llm():
     """Create a mock LLM for testing."""
     llm = MagicMock()
     return llm
+
+
+@pytest.fixture
+def pristine_package_logger():
+    """Hand back an unconfigured ``nemoguardrails.guardrails`` logger, restoring it afterward."""
+    # A test inheriting the configured state cannot tell a fixed constructor from a broken one.
+    logger = logging.getLogger("nemoguardrails.guardrails")
+    saved_handlers = list(logger.handlers)
+    saved_propagate = logger.propagate
+    saved_level = logger.level
+    logger.handlers.clear()
+    logger.propagate = True
+    logger.setLevel(logging.NOTSET)
+    try:
+        yield logger
+    finally:
+        logger.handlers[:] = saved_handlers
+        logger.propagate = saved_propagate
+        logger.setLevel(saved_level)
 
 
 class TestGuardrailsRouting:
@@ -283,6 +303,15 @@ class TestGuardrailsRouting:
             guardrails.rails_engine.explain.assert_called_once()
             guardrails.rails_engine.update_llm.assert_called_once_with(mock_new_llm)
 
+    def test_use_iorails_true_per_tool_config_iorails_cannot_handle_raises(self):
+        """LLMRails never reads tool_output.per_tool / tool_input.per_tool, so a per-tool
+        config IORails cannot handle must raise instead of silently falling back to
+        LLMRails, which would run without the configured per-tool policy at all."""
+        config = _make_iorails_config(rails={"tool_output": {"per_tool": {"run_sql": ["this flow does not exist"]}}})
+
+        with pytest.raises(ValueError, match="per-tool rails"):
+            Guardrails(config=config, use_iorails=True)
+
 
 class TestGuardrailsInit:
     """Tests for Guardrails.__init__ method."""
@@ -304,7 +333,7 @@ class TestGuardrailsInit:
         assert guardrails.rails_engine == mock_llmrails_instance
 
     @patch("nemoguardrails.guardrails.guardrails.LLMRails")
-    def test_init_with_llm(self, mock_llmrails_class, _nemoguards_rails_config, mock_llm):
+    def test_init_with_llm(self, mock_llmrails_class, _nemoguards_rails_config, mock_llm, pristine_package_logger):
         """Test initialization with a custom LLM."""
         mock_llmrails_instance = MagicMock()
         mock_llmrails_class.return_value = mock_llmrails_instance
@@ -346,6 +375,52 @@ class TestGuardrailsInit:
         guardrails = Guardrails(config=_content_safety_rails_config, use_iorails=True)
         assert isinstance(guardrails.rails_engine, IORails)
         mock_iorails_init.assert_called_once_with(_content_safety_rails_config)
+
+
+class TestConstructionLoggingSideEffects:
+    """Constructing Guardrails must not take over the ``nemoguardrails.guardrails`` logger.
+
+    Doing so detaches it from the application's root handlers, silencing that subtree with no error.
+    """
+
+    @patch.object(IORails, "__init__", return_value=None)
+    def test_default_construction_leaves_the_package_logger_propagating(
+        self, _mock_iorails_init, _content_safety_rails_config, pristine_package_logger
+    ):
+        """A default construction leaves package records reaching ancestor handlers."""
+        Guardrails(config=_content_safety_rails_config, use_iorails=True)
+
+        assert pristine_package_logger.propagate is True
+
+    @patch.object(IORails, "__init__", return_value=None)
+    def test_default_construction_adds_no_handler_of_its_own(
+        self, _mock_iorails_init, _content_safety_rails_config, pristine_package_logger
+    ):
+        """A default construction attaches no handler, leaving output routing to the application."""
+        Guardrails(config=_content_safety_rails_config, use_iorails=True)
+
+        assert pristine_package_logger.handlers == []
+
+    @patch.object(IORails, "__init__", return_value=None)
+    def test_records_logged_after_a_default_construction_stay_visible(
+        self, _mock_iorails_init, _content_safety_rails_config, pristine_package_logger, caplog
+    ):
+        """A package record emitted after a construction still reaches caplog, which listens at root."""
+        with caplog.at_level(logging.WARNING):
+            Guardrails(config=_content_safety_rails_config, use_iorails=True)
+            logging.getLogger("nemoguardrails.guardrails.iorails").warning("visible after construction")
+
+        assert "visible after construction" in caplog.text
+
+    @patch.object(IORails, "__init__", return_value=None)
+    def test_verbose_construction_still_configures_the_package_logger(
+        self, _mock_iorails_init, _content_safety_rails_config, pristine_package_logger
+    ):
+        """verbose=True still opts in to the package's own handler and debug level."""
+        Guardrails(config=_content_safety_rails_config, use_iorails=True, verbose=True)
+
+        assert pristine_package_logger.handlers
+        assert pristine_package_logger.level == logging.DEBUG
 
 
 class TestIORailsUnsupportedReason:
@@ -398,7 +473,7 @@ class TestIORailsUnsupportedReason:
         reason = IORails.unsupported_reason(config, llm=None)
 
         assert reason is not None
-        assert "retrieval" in reason
+        assert "relevant_chunks_sep" in reason
 
     def test_a_transform_flow_is_admitted(self):
         """A rewrite-capable surface runs here, having been refused at selection until IORails
@@ -414,6 +489,7 @@ class TestIORailsUnsupportedReason:
                 "input": {"flows": ["content safety check input $model=content_safety"]},
                 "output": {"flows": [_LLMRAILS_ONLY_OUTPUT_FLOW]},
             },
+            extra_prompts=[_LLMRAILS_ONLY_OUTPUT_PROMPT],
         )
         reason = IORails.unsupported_reason(config, llm=None)
         assert reason == _LLMRAILS_ONLY_OUTPUT_REASON
@@ -1267,7 +1343,10 @@ class TestIORailsCanHandle:
                     ]
                 },
             },
-            extra_prompts=[{"task": "self_check_output", "content": "placeholder"}],
+            extra_prompts=[
+                {"task": "self_check_output", "content": "placeholder"},
+                _LLMRAILS_ONLY_OUTPUT_PROMPT,
+            ],
         )
         assert IORails.can_handle(config) is False
 
@@ -1777,7 +1856,9 @@ class TestGuardrailsPickle:
         assert mock_llmrails_init.call_count == 2
 
     @patch.object(IORails, "__init__", return_value=None)
-    def test_getstate_preserves_verbose_true(self, mock_iorails_init, _nemoguards_rails_config):
+    def test_getstate_preserves_verbose_true(
+        self, mock_iorails_init, _nemoguards_rails_config, pristine_package_logger
+    ):
         """__getstate__ captures verbose=True so a verbose Guardrails round-trips
         with logging configuration intact."""
         guardrails = Guardrails(config=_nemoguards_rails_config, verbose=True)
@@ -1793,7 +1874,9 @@ class TestGuardrailsPickle:
         assert guardrails.verbose is True
 
     @patch.object(IORails, "__init__", return_value=None)
-    def test_pickle_round_trip_preserves_verbose(self, mock_iorails_init, _nemoguards_rails_config):
+    def test_pickle_round_trip_preserves_verbose(
+        self, mock_iorails_init, _nemoguards_rails_config, pristine_package_logger
+    ):
         """Full round-trip: a Guardrails constructed with verbose=True must come
         back from __getstate__/__setstate__ with verbose=True. Regression for the
         bug where verbose was hardcoded to False on restore, silently obscuring
@@ -2198,7 +2281,7 @@ class TestScopeGateCharacterization:
             (
                 "self check facts",
                 SurfaceDirection.OUTPUT,
-                "'self check facts' needs retrieval evidence, which manifest-driven execution does not supply yet",
+                "'self check facts' needs context variable(s) 'relevant_chunks', which IORails does not supply",
             ),
             (
                 "content safety check output",

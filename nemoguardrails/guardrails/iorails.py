@@ -32,7 +32,12 @@ from typing import TYPE_CHECKING, Optional, Union
 
 from nemoguardrails.actions.rail_outcome import TransformTarget
 from nemoguardrails.base_guardrails import BaseGuardrails
-from nemoguardrails.exceptions import RailTypeNotConfiguredError, StreamingNotSupportedError
+from nemoguardrails.exceptions import (
+    NonStreamingWorkQueueFullError,
+    RailTypeNotConfiguredError,
+    StreamingCapacityExceededError,
+    StreamingNotSupportedError,
+)
 from nemoguardrails.guardrails.async_work_queue import AsyncWorkQueue
 from nemoguardrails.guardrails.compiled_rail import (
     RailCompilationError,
@@ -105,6 +110,12 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 REFUSAL_MESSAGE = "I'm sorry, I can't respond to that."
+
+# What a rail that *broke* renders, as distinct from one that decided to block. The literal
+# mirrors the sentence LLMRails utters for a failed action, so the same provider outage reads
+# identically whichever engine served the request; changing one without the other splits them
+# again. See the "inform internal error occurred" intent in the two Colang runtimes.
+INTERNAL_ERROR_MESSAGE = "I'm sorry, an internal error has occurred."
 
 # Concurrency budgets for the non-streaming AsyncWorkQueue:
 # NONSTREAM_QUEUE_DEPTH      — max pending items before submit raises QueueFull
@@ -392,13 +403,15 @@ def _build_generation_response(
     return result
 
 
-def _finalize_refusal(structured: bool, log: Optional[GenerationLog] = None) -> Union[LLMMessage, GenerationResponse]:
-    """Shape the refusal message for the active return contract (structured vs bare).
+def _finalize_block(
+    content: str, structured: bool, log: Optional[GenerationLog] = None
+) -> Union[LLMMessage, GenerationResponse]:
+    """Shape *content* for the active return contract (structured vs bare).
 
     On the structured path the collected ``log`` (rails that ran up to the block) is
     attached when the caller requested it.
     """
-    message: LLMMessage = {"role": "assistant", "content": REFUSAL_MESSAGE}
+    message: LLMMessage = {"role": "assistant", "content": content}
     if not structured:
         return message
     result = GenerationResponse(response=[message])
@@ -534,6 +547,13 @@ def _get_last_content_by_role(messages: list[dict], role: str) -> str:
     return ""
 
 
+def _blocked_message(result: RailResult) -> str:
+    """The text a blocked turn returns, which says whether the rail broke or fired."""
+    if result.failed:
+        return INTERNAL_ERROR_MESSAGE
+    return REFUSAL_MESSAGE
+
+
 def _rewritten_user_message(result: RailResult) -> Optional[str]:
     """What the input rails rewrote the user message to, or None when they left it as it came."""
     return result.outcome.transform_text.get(TransformTarget.USER_MESSAGE.value)
@@ -556,10 +576,15 @@ class _TurnConversation:
 
 @dataclass(frozen=True, slots=True)
 class _GeneratedTurn:
-    """The main model's response and the messages it read, or no response when the rails blocked."""
+    """The main model's response and the messages it read, or no response when the rails blocked.
+
+    ``blocked_by`` carries the verdict that stopped the turn, because the caller renders the
+    message from it and a rail that broke reads differently from one that fired.
+    """
 
     response: Optional[LLMResponse]
     messages: LLMMessages
+    blocked_by: Optional[RailResult] = None
 
 
 def _compile_only_deps(config: RailsConfig) -> RailDependencies:
@@ -630,6 +655,18 @@ class IORails(BaseGuardrails):
         )
         for label, flows, supported in tool_checks:
             reason = _unsupported_flows_reason(flows, supported, label)
+            if reason is not None:
+                return reason
+
+        # Per-tool flows are manifest surfaces, like input/output, so check them the same
+        # way rather than let a bad one raise in RailsManager at construction.
+        per_tool_checks = (
+            (config.rails.tool_output.per_tool, SurfaceDirection.TOOL_OUTPUT),
+            (config.rails.tool_input.per_tool, SurfaceDirection.TOOL_INPUT),
+        )
+        for per_tool, direction in per_tool_checks:
+            flows = [flow for tool_flows in per_tool.values() for flow in tool_flows]
+            reason = cls._unservable_rails_reason(flows, direction, deps)
             if reason is not None:
                 return reason
 
@@ -716,6 +753,8 @@ class IORails(BaseGuardrails):
             output_parallel=config.rails.output.parallel or False,
             tool_call_flows=config.rails.tool_output.flows,
             tool_result_flows=config.rails.tool_input.flows,
+            per_tool_call_flows=config.rails.tool_output.per_tool,
+            per_tool_result_flows=config.rails.tool_input.per_tool,
             tracer=self._tracer,
             content_capture_enabled=self._content_capture_enabled,
         )
@@ -903,14 +942,16 @@ class IORails(BaseGuardrails):
         The queue enforces non-streaming concurrency limits
         (``NONSTREAM_MAX_CONCURRENCY`` workers draining up to
         ``NONSTREAM_QUEUE_DEPTH`` pending items).  Callers receive
-        ``asyncio.QueueFull`` when the admission buffer is full and
-        ``guardrails.nonstream.rejections`` increments if metrics are enabled.
+        ``NonStreamingWorkQueueFullError`` when the admission buffer is
+        full and ``guardrails.nonstream.rejections`` increments if metrics
+        are enabled.
 
         Request-level metrics (``guardrails.requests``,
         ``guardrails.request.duration``, ``guardrails.requests.errors``)
         wrap the queue submission, so duration includes queue-wait time
-        (OTEL HTTP semconv).  A ``QueueFull`` rejection shows up in BOTH
-        ``requests.errors{error.type=QueueFull}`` and
+        (OTEL HTTP semconv).  A ``NonStreamingWorkQueueFullError``
+        rejection shows up in BOTH
+        ``requests.errors{error.type=NonStreamingWorkQueueFullError}`` and
         ``nonstream.rejections`` — honest dual-signal reporting.
         """
         messages = self._convert_to_messages(prompt, messages)
@@ -919,10 +960,12 @@ class IORails(BaseGuardrails):
         with metrics_ctx:
             try:
                 return await self._generate_async_queue.submit(self._run_generate, messages, options=options, **kwargs)
-            except asyncio.QueueFull:
+            except asyncio.QueueFull as e:
                 if self._metrics_enabled:
                     record_nonstream_rejected()
-                raise
+                # Same message, more specific type: the server needs to tell
+                # this apart from a full streaming semaphore.
+                raise NonStreamingWorkQueueFullError(*e.args) from e
 
     async def _run_generate(
         self,
@@ -1008,12 +1051,12 @@ class IORails(BaseGuardrails):
         t_start = time.monotonic()
         records: list[RailCallRecord] = []
 
-        def _blocked_return() -> Union[LLMMessage, GenerationResponse]:
-            """Refusal shaped for the return contract, carrying the log of rails run so far."""
+        def _blocked_return(blocked_by: RailResult) -> Union[LLMMessage, GenerationResponse]:
+            """The block shaped for the return contract, carrying the log of rails run so far."""
             log_obj = (
                 _build_generation_log(records, options, time.monotonic() - t_start) if has_generation_options else None
             )
-            return _finalize_refusal(has_generation_options, log_obj)
+            return _finalize_block(_blocked_message(blocked_by), has_generation_options, log_obj)
 
         # Agent/client executes tool-calls and sends results to Main LLM with prior conversation history.
         # Symmetric with INPUT rails
@@ -1024,7 +1067,7 @@ class IORails(BaseGuardrails):
             log.info("[%s] Tool result blocked: %s", req_id, display_reason(tool_result))
             if self._metrics_enabled:
                 record_request_blocked(RailDirection.INPUT)
-            return _blocked_return()
+            return _blocked_return(tool_result)
 
         if self._speculative_generation:
             turn = await self._do_generate_speculative(
@@ -1035,11 +1078,16 @@ class IORails(BaseGuardrails):
                 messages, req_id, llm_kwargs, input_enabled=input_enabled, records_out=records
             )
 
-        if turn.response is None:
-            return _blocked_return()
+        if turn.blocked_by is not None:
+            return _blocked_return(turn.blocked_by)
 
         # What the model read: judging the text an input rail replaced would judge the wrong turn.
         response = turn.response
+        if response is None:
+            # Unreachable: both generation paths name the verdict on the one branch that drops
+            # the response. Raising rather than refusing keeps a future path from reporting a
+            # generation bug to the caller as a guardrail decision.
+            raise RuntimeError("generation returned no response without naming a blocking rail")
         messages = turn.messages
         if conversation is not None:
             conversation.messages = messages
@@ -1064,7 +1112,7 @@ class IORails(BaseGuardrails):
                 log.info("[%s] Tool call blocked: %s", req_id, display_reason(tool_call))
                 if self._metrics_enabled:
                     record_request_blocked(RailDirection.OUTPUT)
-                return _blocked_return()
+                return _blocked_return(tool_call)
 
         # Output rails check the final answer, not reasoning traces.
         # Reasoning is re-attached as <think> tags only below so reasoning intentionally bypasses output
@@ -1080,7 +1128,7 @@ class IORails(BaseGuardrails):
                 log.info("[%s] Output blocked: %s", req_id, display_reason(output_result))
                 if self._metrics_enabled:
                     record_request_blocked(RailDirection.OUTPUT)
-                return _blocked_return()
+                return _blocked_return(output_result)
 
             rewritten = _rewritten_bot_message(output_result)
             if rewritten is not None:
@@ -1133,7 +1181,7 @@ class IORails(BaseGuardrails):
             log.info("[%s] Input blocked: %s", req_id, display_reason(input_result))
             if self._metrics_enabled:
                 record_request_blocked(RailDirection.INPUT)
-            return _GeneratedTurn(response=None, messages=messages)
+            return _GeneratedTurn(response=None, messages=messages, blocked_by=input_result)
 
         rewritten = _rewritten_user_message(input_result)
         if rewritten is not None:
@@ -1165,13 +1213,13 @@ class IORails(BaseGuardrails):
         gen_task = asyncio.create_task(self._timed_main_call(messages, llm_kwargs))
 
         try:
-            response = await self._parallel_input_rail_and_response_generation(
+            turn = await self._parallel_input_rail_and_response_generation(
                 rails_task,
                 gen_task,
                 req_id,
+                messages,
                 request_span,
                 records_out=records_out,
-                main_prompt=serialize_prompt(messages),
             )
         except BaseException as outer_exc:
             for t in (rails_task, gen_task):
@@ -1196,19 +1244,20 @@ class IORails(BaseGuardrails):
                     )
             raise
 
-        return _GeneratedTurn(response=response, messages=messages)
+        return turn
 
     async def _parallel_input_rail_and_response_generation(
         self,
         rails_task: asyncio.Task,
         gen_task: asyncio.Task,
         req_id: str,
+        messages: LLMMessages,
         request_span: Optional["Span"] = None,
         *,
         records_out: Optional[list[RailCallRecord]] = None,
-        main_prompt: str = "",
-    ) -> Optional[LLMResponse]:
-        """Race input rails against LLM generation, return LLMResponse or None (rejected)."""
+    ) -> _GeneratedTurn:
+        """Race input rails against LLM generation, returning the turn either outcome produces."""
+        main_prompt = serialize_prompt(messages)
 
         def _record_generation(timed: TimedLLMResponse) -> None:
             if records_out is not None:
@@ -1245,7 +1294,7 @@ class IORails(BaseGuardrails):
                 set_speculative_span_attrs(
                     request_span, first_completed, GuardrailsAttributes.SPECULATIVE_FIRST_COMPLETED_INPUT_RAILS
                 )
-                return None
+                return _GeneratedTurn(response=None, messages=messages, blocked_by=input_result)
 
             # Rails passed — wait for generation to finish
             timed = await gen_task
@@ -1266,13 +1315,13 @@ class IORails(BaseGuardrails):
                 set_speculative_span_attrs(
                     request_span, first_completed, GuardrailsAttributes.SPECULATIVE_FIRST_COMPLETED_INPUT_RAILS
                 )
-                return None
+                return _GeneratedTurn(response=None, messages=messages, blocked_by=input_result)
 
             set_speculative_span_attrs(request_span, first_completed, "none")
 
         log.debug("[%s] Main LLM response: %s", req_id, truncate(timed.response.content))
         _record_generation(timed)
-        return timed.response
+        return _GeneratedTurn(response=timed.response, messages=messages)
 
     def check(self, messages: LLMMessages, rail_types: Optional[list[RailType]] = None) -> RailsResult:
         """Synchronous version of ``check_async``.
@@ -1324,10 +1373,12 @@ class IORails(BaseGuardrails):
         with metrics_ctx:
             try:
                 return await self._generate_async_queue.submit(self._run_check, messages, rail_types)
-            except asyncio.QueueFull:
+            except asyncio.QueueFull as e:
                 if self._metrics_enabled:
                     record_nonstream_rejected()
-                raise
+                # Same message, more specific type: the server needs to tell
+                # this apart from a full streaming semaphore.
+                raise NonStreamingWorkQueueFullError(*e.args) from e
 
     async def _run_check(self, messages: LLMMessages, rail_types: Optional[list[RailType]]) -> RailsResult:
         """Queue-worker entry for ``check_async``: wrap the rails in a request span."""
@@ -1395,7 +1446,9 @@ class IORails(BaseGuardrails):
                     if self._metrics_enabled:
                         record_request_blocked(RailDirection.INPUT)
                     return RailsResult(
-                        status=RailStatus.BLOCKED, content=REFUSAL_MESSAGE, rail=input_result.triggered_rail
+                        status=RailStatus.BLOCKED,
+                        content=_blocked_message(input_result),
+                        rail=input_result.triggered_rail,
                     )
                 rewritten = _rewritten_user_message(input_result)
                 if rewritten is not None:
@@ -1418,7 +1471,9 @@ class IORails(BaseGuardrails):
                     if self._metrics_enabled:
                         record_request_blocked(RailDirection.OUTPUT)
                     return RailsResult(
-                        status=RailStatus.BLOCKED, content=REFUSAL_MESSAGE, rail=output_result.triggered_rail
+                        status=RailStatus.BLOCKED,
+                        content=_blocked_message(output_result),
+                        rail=output_result.triggered_rail,
                     )
                 rewritten = _rewritten_bot_message(output_result)
                 if rewritten is not None:
@@ -1472,8 +1527,8 @@ class IORails(BaseGuardrails):
                 ``rails.output.streaming.enabled`` is False.
             ValueError: If ``include_metadata=True`` with output rails
                 streaming enabled (BufferStrategy requires plain string chunks).
-            asyncio.QueueFull: If the streaming concurrency limit is
-                reached (load shedding).
+            StreamingCapacityExceededError: If the streaming concurrency
+                limit is reached (load shedding).
         """
         if self._speculative_generation:
             warnings.warn(
@@ -1631,10 +1686,11 @@ class IORails(BaseGuardrails):
 
             Request-level metrics (``guardrails.requests``,
             ``guardrails.request.duration``, ``guardrails.requests.errors``)
-            wrap the entire stream lifecycle, so a ``QueueFull`` on the
-            semaphore check bumps BOTH ``stream.rejections`` and
-            ``requests.errors{error.type=QueueFull}`` — dual-signal
-            semantics matching the non-streaming path.
+            wrap the entire stream lifecycle, so a
+            ``StreamingCapacityExceededError`` on the semaphore check bumps
+            BOTH ``stream.rejections`` and
+            ``requests.errors{error.type=StreamingCapacityExceededError}``
+            — dual-signal semantics matching the non-streaming path.
             """
             # Ensure engines are running (idempotent if already started).
             # Kept outside ``request_metrics`` so duration matches the
@@ -1650,7 +1706,9 @@ class IORails(BaseGuardrails):
                 if self._stream_semaphore.locked():
                     if self._metrics_enabled:
                         record_stream_rejected()
-                    raise asyncio.QueueFull("Streaming concurrency limit reached")
+                    raise StreamingCapacityExceededError(
+                        f"Streaming concurrency limit of {STREAM_MAX_CONCURRENCY} reached"
+                    )
                 await self._stream_semaphore.acquire()
 
                 tracer = self._tracer if self._tracing_enabled else None

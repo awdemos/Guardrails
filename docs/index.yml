@@ -155,6 +155,9 @@ navigation:
               - page: CrowdStrike AIDR
                 path: configure-rails/guardrail-catalog/community/crowdstrike-aidr.mdx
                 slug: crowdstrike-aidr
+              - page: F5 AI Guardrails
+                path: configure-rails/guardrail-catalog/community/f5-ai-guardrails.mdx
+                slug: f5-ai-guardrails
               - page: Fiddler
                 path: configure-rails/guardrail-catalog/community/fiddler.mdx
                 slug: fiddler
@@ -219,6 +222,12 @@ navigation:
           - page: Registering Actions
             path: configure-rails/actions/registering-actions.mdx
             slug: registering-actions
+          - page: Rail Outcomes
+            path: configure-rails/actions/rail-outcomes.mdx
+            slug: rail-outcomes
+          - page: Outbound HTTP
+            path: configure-rails/actions/outbound-http.mdx
+            slug: outbound-http
       - section: Custom Initialization
         path: configure-rails/custom-initialization/index.mdx
         slug: custom-initialization
@@ -519,6 +528,9 @@ navigation:
           - page: OpenTelemetry Metrics Integration
             path: observability/metrics/opentelemetry-integration.mdx
             slug: opentelemetry-integration
+          - page: Prometheus and Grafana for the Guardrails Server
+            path: observability/metrics/server-prometheus-grafana.mdx
+            slug: server-prometheus-grafana
           - page: Metric Reference
             path: observability/metrics/reference.mdx
             slug: reference
@@ -580,6 +592,12 @@ navigation:
       - page: Engine Feature Support
         path: reference/engine-feature-support.mdx
         slug: engine-feature-support
+      - page: Rail Engine Support
+        path: reference/rail-engine-support.mdx
+        slug: rail-engine-support
+      - page: Rail Manifests
+        path: reference/rail-manifests.mdx
+        slug: rail-manifests
       - folder: _static/python-sdk-reference/guardrails-python-sdk
         title: Python SDK Reference
         collapsed: true
@@ -628,6 +646,9 @@ navigation:
     slug: resources
     collapsed: open-by-default
     contents:
+      - page: Runtime Security FAQ
+        path: resources/runtime-security-faq.mdx
+        slug: runtime-security-faq
       - page: Security
         path: resources/security/guidelines.mdx
         slug: guidelines
